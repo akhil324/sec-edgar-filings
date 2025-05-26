@@ -81,13 +81,13 @@ def parse_companyfacts_for_aggregation(json_data, cik_from_filename):
                                     'concept': concept_name,
                                     'label': label,
                                     'unit': unit_type,
-                                    'period_end_date': fact_instance.get('end'),
+                                    'period_end_date': fact_instance.get('end'), # Will be converted to date before to_parquet
                                     'value': processed_value,
                                     'accession_number': fact_instance.get('accn'),
                                     'fiscal_year': processed_fiscal_year, # Use the processed int or pd.NA
                                     'fiscal_period': fact_instance.get('fp'),
                                     'form_type': form_type,
-                                    'filed_date': fact_instance.get('filed'),
+                                    'filed_date': fact_instance.get('filed'), # Will be converted to date before to_parquet
                                     'frame': fact_instance.get('frame')
                                 }
                                 time_series_records_for_cik.append(time_series_record)
@@ -95,10 +95,11 @@ def parse_companyfacts_for_aggregation(json_data, cik_from_filename):
                             if CREATE_FILING_LEVEL_OUTPUT:
                                 # ... (filing level logic remains the same) ...
                                 accn = fact_instance.get('accn')
-                                filed_date = fact_instance.get('filed')
+                                # filed_date for filing_record will be converted before to_parquet if present as a column
+                                filed_date_val = fact_instance.get('filed')
                                 fy_val = fact_instance.get('fy') # Keep original for this JSON
                                 fp = fact_instance.get('fp')
-                                filing_key = (accn, form_type, filed_date, fy_val, fp)
+                                filing_key = (accn, form_type, filed_date_val, fy_val, fp)
                                 if filing_key not in current_cik_filings_aggregator:
                                     current_cik_filings_aggregator[filing_key] = []
                                 current_cik_filings_aggregator[filing_key].append(fact_instance)
@@ -112,7 +113,7 @@ def parse_companyfacts_for_aggregation(json_data, cik_from_filename):
                     'entity_name': entity_name,
                     'accession_number': accn_k,
                     'form_type': form_k,
-                    'filed_date': filed_k,
+                    'filed_date': filed_k, # This will be converted to date before to_parquet
                     'fiscal_year': fy_k, # Store original fiscal year for this output
                     'fiscal_period': fp_k,
                     'all_facts_json_array': json.dumps(list_of_facts)
@@ -166,9 +167,19 @@ def process_companyfacts_zip(zip_filepath, parsing_function):
                     for col in expected_cols_filing:
                         if col not in df_filing.columns: df_filing[col] = None
                     df_filing = df_filing[expected_cols_filing]
-                    # For filing_level_output, fiscal_year might still contain None directly from JSON
-                    # If strict Spark compatibility is needed here too, apply Int64Dtype or keep as object (string).
-                    # df_filing['fiscal_year'] = df_filing['fiscal_year'].astype(pd.Int64Dtype())
+                    
+                    # --- FIX: Convert filed_date to datetime.date objects ---
+                    if 'filed_date' in df_filing.columns:
+                        df_filing['filed_date'] = pd.to_datetime(df_filing['filed_date'], errors='coerce').dt.date
+                    # --- END FIX ---
+                    
+                    # Apply Int64Dtype for fiscal_year if it's in this DataFrame
+                    if 'fiscal_year' in df_filing.columns: # Ensure fiscal_year exists before trying to cast
+                         try:
+                            df_filing['fiscal_year'] = pd.to_numeric(df_filing['fiscal_year'], errors='coerce').astype(pd.Int64Dtype())
+                         except Exception as e_fy_filing:
+                            print(f"Warning (Filing Level): Could not convert fiscal_year. Error: {e_fy_filing}")
+
 
                     output_path = os.path.join(OUTPUT_DIR_FILING_LEVEL, f"{OUTPUT_FILE_PREFIX_FILING_LEVEL}_batch_{filing_level_batch_counter}.parquet")
                     df_filing.to_parquet(output_path, engine='pyarrow', index=False)
@@ -181,29 +192,37 @@ def process_companyfacts_zip(zip_filepath, parsing_function):
                     df_ts = pd.DataFrame(all_time_series_batch_data)
                     expected_cols_ts = ['cik', 'entity_name', 'taxonomy', 'concept', 'label', 'unit', 'period_end_date', 'value', 'accession_number', 'fiscal_year', 'fiscal_period', 'form_type', 'filed_date', 'frame']
                     for col in expected_cols_ts:
-                         if col not in df_ts.columns: df_ts[col] = None # Ensure all columns exist
-                    df_ts = df_ts[expected_cols_ts] # Enforce column order
+                         if col not in df_ts.columns: df_ts[col] = None 
+                    df_ts = df_ts[expected_cols_ts] 
 
-                    # Explicitly define dtypes for Spark compatibility
-                    # This uses Pandas nullable types where appropriate
+                    # --- FIX: Convert date columns to datetime.date objects ---
+                    if 'filed_date' in df_ts.columns:
+                        df_ts['filed_date'] = pd.to_datetime(df_ts['filed_date'], errors='coerce').dt.date
+                    if 'period_end_date' in df_ts.columns: 
+                        df_ts['period_end_date'] = pd.to_datetime(df_ts['period_end_date'], errors='coerce').dt.date
+                    # --- END FIX ---
+
                     dtype_map_ts = {
-                        'value': 'float64',             # Already handled to be float or NaN
-                        'fiscal_year': pd.Int64Dtype()  # Use Pandas nullable integer type
+                        'value': 'float64',            
+                        'fiscal_year': pd.Int64Dtype() 
                     }
                     for col, dt in dtype_map_ts.items():
                         if col in df_ts.columns:
                             try:
-                                df_ts[col] = df_ts[col].astype(dt)
-                            except Exception as e_dtype:
-                                print(f"Warning: Could not convert column {col} to {dt} for DataFrame. Error: {e_dtype}")
-                                # Fallback for fiscal_year if Int64Dtype conversion has issues with mixed types unexpectedly
-                                if col == 'fiscal_year':
-                                    print(f"Attempting pd.to_numeric for {col} as fallback.")
+                                if col == 'fiscal_year': # Special handling for nullable int
                                     df_ts[col] = pd.to_numeric(df_ts[col], errors='coerce').astype(pd.Int64Dtype())
-
-
+                                else:
+                                    df_ts[col] = df_ts[col].astype(dt)
+                            except Exception as e_dtype:
+                                print(f"Warning (Time Series): Could not convert column {col} to {dt} for DataFrame. Error: {e_dtype}")
+                                if col == 'fiscal_year':
+                                    print(f"Attempting pd.to_numeric for {col} as fallback after error.")
+                                    try:
+                                        df_ts[col] = pd.to_numeric(df_ts[col], errors='coerce').astype(pd.Int64Dtype())
+                                    except Exception as e_fallback:
+                                        print(f"Fallback for {col} also failed. Error: {e_fallback}")
+                                        
                     output_path = os.path.join(OUTPUT_DIR_TIME_SERIES, f"{OUTPUT_FILE_PREFIX_TIME_SERIES}_batch_{time_series_batch_counter}.parquet")
-                    # PyArrow should now write fiscal_year in a way Spark prefers for nullable integers
                     df_ts.to_parquet(output_path, engine='pyarrow', index=False, coerce_timestamps='ms', allow_truncated_timestamps=False)
                     print(f"TIME-SERIES: Processed {cik_file_counter}/{total_cik_files} CIKs. Saved batch {time_series_batch_counter} ({len(df_ts)} records) to {output_path}")
                     total_time_series_records_written += len(df_ts)
@@ -217,6 +236,54 @@ def process_companyfacts_zip(zip_filepath, parsing_function):
             except Exception as e:
                 error_message = f"An error occurred processing CIK {cik_from_filename} (file: {member_name}): {type(e).__name__} - {e}"
                 print(error_message)
+
+    # Final check for any remaining data in the last batch for FILING_LEVEL
+    if CREATE_FILING_LEVEL_OUTPUT and all_filing_level_batch_data:
+        df_filing = pd.DataFrame(all_filing_level_batch_data)
+        expected_cols_filing = ['cik', 'entity_name', 'accession_number', 'form_type', 'filed_date', 'fiscal_year', 'fiscal_period', 'all_facts_json_array']
+        for col in expected_cols_filing:
+            if col not in df_filing.columns: df_filing[col] = None
+        df_filing = df_filing[expected_cols_filing]
+        if 'filed_date' in df_filing.columns:
+            df_filing['filed_date'] = pd.to_datetime(df_filing['filed_date'], errors='coerce').dt.date
+        if 'fiscal_year' in df_filing.columns:
+            try:
+                df_filing['fiscal_year'] = pd.to_numeric(df_filing['fiscal_year'], errors='coerce').astype(pd.Int64Dtype())
+            except Exception as e_fy_final_filing:
+                print(f"Warning (Final Filing Batch): Could not convert fiscal_year. Error: {e_fy_final_filing}")
+        output_path = os.path.join(OUTPUT_DIR_FILING_LEVEL, f"{OUTPUT_FILE_PREFIX_FILING_LEVEL}_batch_{filing_level_batch_counter}.parquet")
+        df_filing.to_parquet(output_path, engine='pyarrow', index=False)
+        print(f"FILING-LEVEL: Saved final batch {filing_level_batch_counter} ({len(df_filing)} records) to {output_path}")
+        total_filing_records_written += len(df_filing)
+
+    # Final check for any remaining data in the last batch for TIME_SERIES
+    if CREATE_TIME_SERIES_OUTPUT and all_time_series_batch_data:
+        df_ts = pd.DataFrame(all_time_series_batch_data)
+        expected_cols_ts = ['cik', 'entity_name', 'taxonomy', 'concept', 'label', 'unit', 'period_end_date', 'value', 'accession_number', 'fiscal_year', 'fiscal_period', 'form_type', 'filed_date', 'frame']
+        for col in expected_cols_ts:
+            if col not in df_ts.columns: df_ts[col] = None
+        df_ts = df_ts[expected_cols_ts]
+        if 'filed_date' in df_ts.columns:
+            df_ts['filed_date'] = pd.to_datetime(df_ts['filed_date'], errors='coerce').dt.date
+        if 'period_end_date' in df_ts.columns:
+            df_ts['period_end_date'] = pd.to_datetime(df_ts['period_end_date'], errors='coerce').dt.date
+        dtype_map_ts = {
+            'value': 'float64',
+            'fiscal_year': pd.Int64Dtype()
+        }
+        for col, dt in dtype_map_ts.items():
+            if col in df_ts.columns:
+                try:
+                    if col == 'fiscal_year':
+                        df_ts[col] = pd.to_numeric(df_ts[col], errors='coerce').astype(pd.Int64Dtype())
+                    else:
+                        df_ts[col] = df_ts[col].astype(dt)
+                except Exception as e_dtype_final:
+                    print(f"Warning (Final Time Series Batch): Could not convert column {col} to {dt}. Error: {e_dtype_final}")
+        output_path = os.path.join(OUTPUT_DIR_TIME_SERIES, f"{OUTPUT_FILE_PREFIX_TIME_SERIES}_batch_{time_series_batch_counter}.parquet")
+        df_ts.to_parquet(output_path, engine='pyarrow', index=False, coerce_timestamps='ms', allow_truncated_timestamps=False)
+        print(f"TIME-SERIES: Saved final batch {time_series_batch_counter} ({len(df_ts)} records) to {output_path}")
+        total_time_series_records_written += len(df_ts)
 
     print(f"\nFinished processing {zip_filepath}.")
     if CREATE_FILING_LEVEL_OUTPUT:
